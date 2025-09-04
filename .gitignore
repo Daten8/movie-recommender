@@ -1,0 +1,5 @@
+data/ml-latest-small/*
+!data/README.md
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
