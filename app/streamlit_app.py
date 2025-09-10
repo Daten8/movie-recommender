@@ -1,28 +1,37 @@
 """
-Streamlit app (fixed): use TMDb when available, else use Wikimedia REST summary endpoint for posters+extract.
-This file is a focused patch over previous app: improved Wikipedia fetching and visible debug source badges.
+Streamlit app: TF-IDF content recommender + ALS collaborative + Hybrid
+Place MovieLens ml-latest-small under data/ml-latest-small/
+Place trained ALS artifacts under models/: item_factors.npy, user_factors.npy, mappings.pkl, train_user_seen.pkl
+Run: streamlit run app/streamlit_app.py
 """
 from pathlib import Path
-import pickle, urllib.parse
+import pickle
 import numpy as np
 import pandas as pd
 import streamlit as st
-import requests
-from requests.exceptions import RequestException
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MinMaxScaler
 
+# -------------------- Paths --------------------
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "ml-latest-small"
 MODELS_DIR = ROOT / "models"
-LINKS_PATH = DATA_DIR / "links.csv"
 
+# -------------------- Page config --------------------
 st.set_page_config(page_title="Movie Recommender (TF-IDF + ALS)", page_icon="🎬", layout="centered")
-st.title("🎬 Movie Recommender — Posters (TMDb → Wikipedia REST fallback)")
+st.title("🎬 Movie Recommender — TF-IDF + ALS (Hybrid)")
 
-# --- load movies (unchanged) ---
+# -------------------- Helpers: find files --------------------
+def require_file(p: Path, what: str):
+    if not p.exists():
+        st.error(f"Missing {what}: {p}\nPlease put the required file and reload the app.")
+        st.stop()
+
+require_file(DATA_DIR / "movies.csv", "movies.csv")
+
+# -------------------- Load & prepare movies + TF-IDF --------------------
 @st.cache_data(show_spinner=False)
 def load_movies(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -31,227 +40,259 @@ def load_movies(path: Path) -> pd.DataFrame:
     df = df.copy()
     df["genres"] = df["genres"].fillna("").astype(str).str.replace("|", " ", regex=False)
     df["clean_title"] = df["title"].astype(str).str.replace(r"\(\d{4}\)", "", regex=True).str.strip()
-    df["year"] = df["title"].str.extract(r"\((\d{4})\)").astype(float).fillna(np.nan).astype("Int64")
     df["doc"] = (df["clean_title"].fillna("") + " " + df["genres"]).str.lower()
-    return df[["movieId","title","clean_title","year","genres","doc"]].reset_index(drop=True)
+    return df[["movieId", "title", "genres", "clean_title", "doc"]].reset_index(drop=True)
 
 movies = load_movies(DATA_DIR / "movies.csv")
 
 @st.cache_resource(show_spinner=False)
 def build_tfidf(docs: pd.Series):
-    vec = TfidfVectorizer(stop_words="english", ngram_range=(1,2), min_df=2)
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=2)
     X = vec.fit_transform(docs)
     return vec, X
 
 tfidf_vec, X = build_tfidf(movies["doc"])
 
-# --- load links mapping ---
-@st.cache_data(show_spinner=False)
-def load_links(path: Path):
-    if not path.exists():
-        return {}
-    links = pd.read_csv(path)
-    if "tmdbId" in links.columns:
-        links = links[["movieId","tmdbId"]].dropna()
-        links["movieId"] = links["movieId"].astype(int)
-        links["tmdbId"] = links["tmdbId"].astype(int)
-        return dict(zip(links["movieId"].tolist(), links["tmdbId"].tolist()))
-    return {}
+# -------------------- TF-IDF recommenders --------------------
+def recommend_from_title(query: str, top_k: int = 10, min_sim: float = 0.10):
+    if not query or not query.strip():
+        return pd.DataFrame(columns=["title", "genres"]), 0.0
+    q = query.strip().lower()
+    q_vec = tfidf_vec.transform([q])
+    sims_to_query = cosine_similarity(q_vec, X).ravel()
+    best_sim = float(np.max(sims_to_query)) if sims_to_query.size else 0.0
+    if best_sim < min_sim:
+        return pd.DataFrame(columns=["title", "genres"]), best_sim
+    seed_idx = int(np.argmax(sims_to_query))
+    seed_vec = X[seed_idx]
+    sims = cosine_similarity(seed_vec, X).ravel()
+    order = np.argsort(-sims)
+    order = [i for i in order if i != seed_idx][:top_k]
+    recs = movies.iloc[order][["title", "genres"]].reset_index(drop=True)
+    recs.index = range(1, len(recs) + 1)
+    return recs, best_sim
 
-movie_to_tmdb = load_links(LINKS_PATH)
-
-# --- TMDb optional (unchanged) ---
-TMDB_API_KEY = None
-try:
-    TMDB_API_KEY = st.secrets["TMDB_API_KEY"]
-except Exception:
-    import os
-    TMDB_API_KEY = os.environ.get("TMDB_API_KEY", None)
-TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w185"
-
-def fetch_tmdb_metadata(tmdb_id: int):
-    if TMDB_API_KEY is None or tmdb_id is None:
-        return None
-    try:
-        url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
-        resp = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=6)
-        resp.raise_for_status()
-        d = resp.json()
-        poster = d.get("poster_path")
-        poster_url = f"{TMDB_IMAGE_BASE}{poster}" if poster else None
-        overview = d.get("overview") or ""
-        return {"poster_url": poster_url, "overview": overview, "source": "tmdb"}
-    except RequestException:
-        return None
-
-# --- NEW: Wikimedia REST summary endpoint (reliable) ---
-WIKI_REST_BASE = "https://en.wikipedia.org/api/rest_v1/page/summary/"
-
-def fetch_wikipedia_summary(title: str, year=None):
-    """
-    Use Wikimedia REST summary endpoint. Returns dict {poster_url, overview, source} or None.
-    """
-    if not title:
-        return None
-    # prefer "Title (year)" when year is available to disambiguate
-    query_title = title
-    if year and not pd.isna(year):
-        try:
-            y = int(year)
-            query_title = f"{title} ({y})"
-        except Exception:
-            query_title = title
-    # URL-encode the page title; use requests to fetch
-    encoded = urllib.parse.quote(query_title, safe='')
-    url = WIKI_REST_BASE + encoded
-    headers = {"User-Agent": "MovieRecommender/1.0 (contact: you@example.com)"}  # replace contact if you like
-    try:
-        r = requests.get(url, headers=headers, timeout=6)
-        if r.status_code == 404:
-            # fallback: try searching without year
-            if "(" in query_title:
-                return fetch_wikipedia_summary(title, year=None)
-            return None
-        r.raise_for_status()
-        js = r.json()
-        thumb = None
-        if "thumbnail" in js and js["thumbnail"] and js["thumbnail"].get("source"):
-            thumb = js["thumbnail"]["source"]
-        extract = js.get("extract") or ""
-        return {"poster_url": thumb, "overview": extract, "source": "wiki"}
-    except RequestException:
-        return None
-    except ValueError:
-        return None
-
-# --- unified metadata getter with caching ---
-@st.cache_data(show_spinner=False, ttl=60*60*24)
-def get_metadata_for_movie(movieid: int, title: str, year):
-    # 1) TMDb if available
-    tmdb_id = movie_to_tmdb.get(int(movieid))
-    if tmdb_id is not None and TMDB_API_KEY:
-        m = fetch_tmdb_metadata(tmdb_id)
-        if m:
-            return m
-    # 2) Wikimedia REST fallback
-    wiki_m = fetch_wikipedia_summary(title, year)
-    if wiki_m:
-        return wiki_m
-    # 3) none
-    return {"poster_url": None, "overview": "", "source": "none"}
-
-# --- helper for rendering cards ---
-def short_text(s: str, n=240):
-    if not s:
-        return ""
-    s = s.strip()
-    return s if len(s) <= n else s[:n].rsplit(" ",1)[0] + " ..."
-
-def render_cards_from_df(df, cols_per_row=3):
-    if df.empty:
-        st.info("No recommendations.")
-        return
-    for start in range(0, len(df), cols_per_row):
-        slice_df = df.iloc[start:start+cols_per_row]
-        cols = st.columns(len(slice_df))
-        for c, (_, row) in zip(cols, slice_df.iterrows()):
-            mid = int(row.get("movieId"))
-            title = row.get("title", "")
-            score = row.get("score", None)
-            # fetch metadata (cached)
-            meta = get_metadata_for_movie(mid, movies.loc[movies['movieId']==mid, 'clean_title'].iloc[0],
-                                         movies.loc[movies['movieId']==mid, 'year'].iloc[0])
-            poster = meta.get("poster_url")
-            overview = meta.get("overview")
-            source = meta.get("source")
-            if poster:
-                # Show poster, then title and short summary
-                try:
-                    c.image(poster, use_column_width=True, caption=title)
-                except Exception:
-                    # image fetch/display error -> fallback to text
-                    c.write("**" + title + "**")
-                    if overview:
-                        c.write(short_text(overview))
-                else:
-                    if overview:
-                        c.write(short_text(overview))
-            else:
-                # text fallback
-                c.write("**" + title + "**")
-                if overview:
-                    c.write(short_text(overview))
-                else:
-                    # show genres as fallback
-                    gr = movies.loc[movies['movieId']==mid, 'genres']
-                    if not gr.empty:
-                        c.write(gr.iloc[0])
-            if score is not None:
-                c.caption(f"score: {score:.3f} • meta: {source}")
-
-# --- minimal TF-IDF & ALS & Hybrid (kept simple) ---
-# (Re-use your existing recommenders; assume they exist below)
-# For brevity include a minimal TF-IDF recommender and reuse ALS/hybrid functions if present.
-# If your project file already contains recommend_from_title, recommend_from_likes_safe,
-# als_recommend_for_user and hybrid_recommend, keep them. Otherwise a small TF-IDF sample:
-def recommend_from_title(q, top_k=9):
-    q = q or ""
-    q_vec = tfidf_vec.transform([q.strip().lower()])
-    sims = cosine_similarity(q_vec, X).ravel()
-    if sims.size == 0:
-        return pd.DataFrame(columns=["movieId","title"])
-    order = np.argsort(-sims)[:top_k]
-    recs = movies.iloc[order][["movieId","title"]].copy().reset_index(drop=True)
+def recommend_from_likes_safe(selected_titles: list, top_k: int = 10):
+    if not selected_titles:
+        return pd.DataFrame(columns=["title", "genres"])
+    if not isinstance(selected_titles, (list, tuple)):
+        raise TypeError("selected_titles must be a list or tuple of titles")
+    mask = movies["title"].isin(selected_titles)
+    idxs = movies.index[mask].tolist()
+    if not idxs:
+        return pd.DataFrame(columns=["title", "genres"])
+    profile = X[idxs].mean(axis=0)
+    if sparse.issparse(profile):
+        query = profile
+    else:
+        query = np.asarray(profile)
+        if query.ndim == 1:
+            query = query.reshape(1, -1)
+    sims = cosine_similarity(query, X).ravel()
+    order = np.argsort(-sims)
+    liked_set = set(idxs)
+    rec_indices = [i for i in order if i not in liked_set][:top_k]
+    recs = movies.iloc[rec_indices][["title", "genres"]].copy().reset_index(drop=True)
+    recs.index = range(1, len(recs) + 1)
     return recs
 
-# Try to load ALS artifacts (if present)
-def load_als_artifacts_simple():
+# -------------------- ALS artifacts loader --------------------
+@st.cache_resource(show_spinner=False)
+def load_als_artifacts():
     md = MODELS_DIR
-    need = [md/"item_factors.npy", md/"user_factors.npy", md/"mappings.pkl", md/"train_user_seen.pkl"]
+    need = [md / "item_factors.npy", md / "user_factors.npy", md / "mappings.pkl", md / "train_user_seen.pkl"]
     for p in need:
         if not p.exists():
             return None
-    item_f = np.load(md/"item_factors.npy")
-    user_f = np.load(md/"user_factors.npy")
-    with open(md/"mappings.pkl","rb") as f:
+    item_f = np.load(md / "item_factors.npy")
+    user_f = np.load(md / "user_factors.npy")
+    with open(md / "mappings.pkl", "rb") as f:
         maps = pickle.load(f)
-    with open(md/"train_user_seen.pkl","rb") as f:
+    with open(md / "train_user_seen.pkl", "rb") as f:
         train_user_seen = pickle.load(f)
-    return {"item_f":item_f,"user_f":user_f,"maps":maps,"train_user_seen":train_user_seen}
+    return {"item_f": item_f, "user_f": user_f, "maps": maps, "train_user_seen": train_user_seen}
 
-als_art = load_als_artifacts_simple()
-has_als = als_art is not None
-if has_als:
-    item_f = als_art["item_f"]; user_f = als_art["user_f"]; maps = als_art["maps"]; train_user_seen = als_art["train_user_seen"]
-    item2idx = maps["item2idx"]; idx2item = maps["idx2item"]; user2idx = maps["user2idx"]
+als_art = load_als_artifacts()
+if als_art is None:
+    st.sidebar.warning("ALS artifacts not found in /models. ALS and Hybrid options will be disabled until artifacts are placed.")
+else:
+    item_f = als_art["item_f"]
+    user_f = als_art["user_f"]
+    maps = als_art["maps"]
+    train_user_seen = als_art["train_user_seen"]
+    item2idx = maps["item2idx"]
+    idx2item = maps["idx2item"]
+    user2idx = maps["user2idx"]
+    idx2user = maps["idx2user"]
+    # build helper: map movieId -> row index in movies DataFrame (for TF-IDF alignment)
+    movieid_to_row = {int(mid): int(i) for i, mid in movies["movieId"].reset_index(drop=True).items()}
+    # Ensure idx2item corresponds to ALS item ordering; n_items:
+    n_items = item_f.shape[0]
 
-# --- UI: simple demo to check posters ---
-st.sidebar.header("Quick poster test")
-test_title = st.sidebar.text_input("Movie title to test (e.g., Toy Story)", value="")
-test_year = st.sidebar.text_input("Year (optional)", value="")
-if st.sidebar.button("Fetch test metadata"):
-    # find movieId candidates by title substring
-    candidates = movies[movies['clean_title'].str.contains(test_title, case=False, na=False)]
-    if candidates.empty:
-        st.sidebar.warning("No local movie matched that title. Try a different query.")
+# -------------------- ALS / Hybrid recommenders --------------------
+def als_recommend_for_user(raw_userid, k=10):
+    # returns DataFrame of title & score
+    if als_art is None:
+        return pd.DataFrame(columns=["title", "score"])
+    if raw_userid not in user2idx:
+        return pd.DataFrame(columns=["title", "score"])    
+    uidx = user2idx[raw_userid]
+    uvec = user_f[uidx]
+    scores = item_f.dot(uvec)
+    # mask seen
+    seen = train_user_seen.get(uidx, np.array([], dtype=int))
+    if seen.size:
+        seen = seen[seen < scores.shape[0]]
+        scores[seen] = -np.inf
+    if k >= scores.size:
+        order = np.argsort(-scores)
     else:
-        # pick first candidate, show metadata
-        mid = int(candidates.iloc[0]['movieId'])
-        ctitle = candidates.iloc[0]['clean_title']
-        cyear = candidates.iloc[0]['year']
-        st.sidebar.write("Local match:", ctitle, cyear, "movieId:", mid)
-        meta = get_metadata_for_movie(mid, ctitle, cyear)
-        st.sidebar.write("metadata (debug):", meta)
-        if meta.get("poster_url"):
-            st.sidebar.image(meta.get("poster_url"), width=150)
-        else:
-            st.sidebar.write("No poster found; source:", meta.get("source"))
+        part = np.argpartition(-scores, k)[:k]
+        order = part[np.argsort(-scores[part])]
+    rows = []
+    for iid in order[:k]:
+        mid = idx2item[int(iid)]
+        title = movies.loc[movies['movieId']==mid, 'title'].iloc[0]
+        rows.append({"title": title, "score": float(scores[iid])})
+    df = pd.DataFrame(rows)
+    df.index = range(1, len(df) + 1)
+    return df
 
-st.write("### Demo recommendations (TF-IDF quick mode)")
-q = st.text_input("Type a keyword or movie (quick TF-IDF demo):", value="Toy Story")
-if st.button("Recommend (quick)"):
-    recs = recommend_from_title(q, top_k=9)
-    render_cards_from_df(recs, cols_per_row=3)
+def hybrid_recommend(raw_userid, k=10, als_weight=0.6):
+    # Hybrid: normalized ALS score + TF-IDF profile similarity aligned to ALS item ordering
+    if als_art is None:
+        return pd.DataFrame(columns=["title","score"])
+    if raw_userid not in user2idx:
+        return pd.DataFrame(columns=["title","score"])
+    uidx = user2idx[raw_userid]
+    # ALS scores (length = n_items)
+    uvec = user_f[uidx]
+    als_scores = item_f.dot(uvec).astype(float)  # length == n_items
+
+    # TF-IDF profile from user's seen movies -> compute TF scores for full movies list
+    seen_raw = [idx2item[i] for i in train_user_seen.get(uidx, [])]
+    if len(seen_raw) == 0:
+        tf_scores_items = np.zeros(als_scores.shape[0], dtype=float)
+    else:
+        mask_series = movies['movieId'].isin(seen_raw)
+        mask = np.asarray(mask_series, dtype=bool)
+        if mask.sum() == 0:
+            tf_scores_items = np.zeros(als_scores.shape[0], dtype=float)
+        else:
+            profile = X[mask].mean(axis=0)
+            # convert profile to 2D numpy array
+            if sparse.issparse(profile):
+                try:
+                    profile_arr = profile.toarray()
+                except Exception:
+                    profile_arr = np.asarray(profile)
+            else:
+                profile_arr = np.asarray(profile)
+            profile_arr = np.atleast_2d(profile_arr)
+            tf_scores_all = cosine_similarity(profile_arr, X).ravel()  # length == len(movies)
+            # Align tf_scores_all (movies order) to ALS item ordering (idx2item)
+            tf_scores_items = np.zeros(als_scores.shape[0], dtype=float)
+            for i in range(als_scores.shape[0]):
+                mid = idx2item[int(i)]
+                row = movieid_to_row.get(int(mid), None)
+                if row is None:
+                    tf_scores_items[i] = 0.0
+                else:
+                    tf_scores_items[i] = float(tf_scores_all[row])
+
+    # normalize
+    scaler = MinMaxScaler()
+    try:
+        als_norm = scaler.fit_transform(als_scores.reshape(-1,1)).ravel()
+        tf_norm = scaler.fit_transform(tf_scores_items.reshape(-1,1)).ravel()
+    except Exception:
+        als_norm = als_scores
+        tf_norm = tf_scores_items
+
+    combined = als_weight * als_norm + (1-als_weight) * tf_norm
+
+    # mask seen
+    seen = train_user_seen.get(uidx, np.array([], dtype=int))
+    if seen.size:
+        combined[seen] = -np.inf
+
+    # top-k
+    if k >= len(combined):
+        order = np.argsort(-combined)
+    else:
+        part = np.argpartition(-combined, k)[:k]
+        order = part[np.argsort(-combined[part])]
+
+    rows = []
+    for iid in order[:k]:
+        mid = idx2item[int(iid)]
+        title = movies.loc[movies['movieId']==mid,'title'].iloc[0]
+        rows.append({"title": title, "score": float(combined[iid])})
+    df = pd.DataFrame(rows)
+    df.index = range(1, len(df) + 1)
+    return df
+
+# -------------------- UI --------------------
+with st.sidebar:
+    st.header("Settings")
+    algorithm = st.selectbox("Algorithm", ["TF-IDF (content)", "ALS (collaborative)", "Hybrid (ALS+TF-IDF)"], index=0)
+    k = st.slider("Number of recommendations", min_value=5, max_value=30, value=10)
+
+st.write("### How to use")
+st.write("- **TF-IDF**: type a movie name (free-text) or pick multiple liked movies.\n- **ALS**: pick a user id from the dropdown. Requires models/*.\n- **Hybrid**: combine ALS & TF-IDF (best of both worlds).")
+
+if algorithm == "TF-IDF (content)":
+    mode = st.radio("Mode:", ["Single movie", "Multiple likes"])    
+    if mode == "Single movie":
+        with st.form("single_form"):
+            q = st.text_input("Enter a movie you like (free-text)")
+            submitted = st.form_submit_button("Recommend")
+            if submitted:
+                recs, sim = recommend_from_title(q, top_k=k)
+                if recs.empty:
+                    st.warning("No strong match found. Try different keywords or use Multiple likes.")
+                else:
+                    st.subheader("Recommendations (TF-IDF)")
+                    st.dataframe(recs)
+    else:
+        picks = st.multiselect("Select your liked movies (exact titles)", movies['title'].tolist(), max_selections=10)
+        if st.button("Recommend"):
+            if not picks:
+                st.warning("Please select one or more movies.")
+            else:
+                recs = recommend_from_likes_safe(picks, top_k=k)
+                st.subheader("Recommendations (TF-IDF)")
+                st.dataframe(recs)
+
+elif algorithm == "ALS (collaborative)":
+    if als_art is None:
+        st.error("ALS artifacts not found in models/. Train ALS and save item_factors/user_factors/mappings/train_user_seen.")
+    else:
+        # limit dropdown length for UI
+        user_list = sorted(list(maps['user2idx'].keys()))
+        sel = st.selectbox("Select user id (demo)", user_list[:200])
+        if st.button("Recommend (ALS)"):
+            recs = als_recommend_for_user(sel, k)
+            if recs.empty:
+                st.warning("No recommendations (user not found or no artifacts).")
+            else:
+                st.subheader("Recommendations (ALS)")
+                st.dataframe(recs)
+
+else:  # Hybrid
+    if als_art is None:
+        st.error("ALS artifacts not found in models/. Hybrid disabled.")
+    else:
+        user_list = sorted(list(maps['user2idx'].keys()))
+        sel = st.selectbox("Select user id (demo)", user_list[:200])
+        als_w = st.slider("ALS weight", 0.0, 1.0, 0.6)
+        if st.button("Recommend (Hybrid)"):
+            recs = hybrid_recommend(sel, k, als_w)
+            if recs.empty:
+                st.warning("No recommendations (user not found or no artifacts).")
+            else:
+                st.subheader("Recommendations (Hybrid)")
+                st.dataframe(recs)
 
 st.markdown("---")
-st.caption("If posters are still not showing: check the small sidebar test (enter a title) — it prints metadata and displays the poster if found. If metadata shows 'source: none' paste the title and I'll debug that page.")
+st.caption("TF-IDF + ALS hybrid recommender — use TF-IDF for cold-start and ALS for personalization.")
