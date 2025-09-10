@@ -169,12 +169,19 @@ def hybrid_recommend(raw_userid, k=10, als_weight=0.6):
     if len(seen_raw) == 0:
         tf_scores = np.zeros(len(movies))
     else:
-        mask = movies['movieId'].isin(seen_raw)
+        # Convert pandas boolean mask to numpy boolean array to index sparse X safely
+        mask_series = movies['movieId'].isin(seen_raw)
+        mask = np.asarray(mask_series, dtype=bool)
         if mask.sum() == 0:
             tf_scores = np.zeros(len(movies))
         else:
             profile = X[mask].mean(axis=0)
-            profile = profile if sparse.issparse(profile) else sparse.csr_matrix(profile)
+            # ensure profile is 2D for cosine_similarity
+            if sparse.issparse(profile):
+                if getattr(profile, "ndim", 2) == 1:
+                    profile = profile.reshape(1, -1)
+            else:
+                profile = np.atleast_2d(profile)
             tf_scores = cosine_similarity(profile, X).ravel()
     # normalize
     scaler = MinMaxScaler()
@@ -182,7 +189,7 @@ def hybrid_recommend(raw_userid, k=10, als_weight=0.6):
         als_norm = scaler.fit_transform(als_scores.reshape(-1,1)).ravel()
         tf_norm = scaler.fit_transform(tf_scores.reshape(-1,1)).ravel()
     except Exception:
-        # fallback if zero-vector
+        # fallback if zero-vector or any issue
         als_norm = als_scores
         tf_norm = tf_scores
     combined = als_weight * als_norm + (1-als_weight) * tf_norm
