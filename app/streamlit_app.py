@@ -124,6 +124,10 @@ else:
     idx2item = maps["idx2item"]
     user2idx = maps["user2idx"]
     idx2user = maps["idx2user"]
+    # build helper: map movieId -> row index in movies DataFrame (for TF-IDF alignment)
+    movieid_to_row = {int(mid): int(i) for i, mid in movies["movieId"].reset_index(drop=True).items()}
+    # Ensure idx2item corresponds to ALS item ordering; n_items:
+    n_items = item_f.shape[0]
 
 # -------------------- ALS / Hybrid recommenders --------------------
 def als_recommend_for_user(raw_userid, k=10):
@@ -155,28 +159,28 @@ def als_recommend_for_user(raw_userid, k=10):
     return df
 
 def hybrid_recommend(raw_userid, k=10, als_weight=0.6):
-    # Hybrid: normalized ALS score + TF-IDF profile similarity
+    # Hybrid: normalized ALS score + TF-IDF profile similarity aligned to ALS item ordering
     if als_art is None:
         return pd.DataFrame(columns=["title","score"])
     if raw_userid not in user2idx:
-        return pd.DataFrame(columns=["title","score"])    
+        return pd.DataFrame(columns=["title","score"])
     uidx = user2idx[raw_userid]
-    # ALS scores
+    # ALS scores (length = n_items)
     uvec = user_f[uidx]
-    als_scores = item_f.dot(uvec).astype(float)
-    # TF-IDF profile from user's seen movies
+    als_scores = item_f.dot(uvec).astype(float)  # length == n_items
+
+    # TF-IDF profile from user's seen movies -> compute TF scores for full movies list
     seen_raw = [idx2item[i] for i in train_user_seen.get(uidx, [])]
     if len(seen_raw) == 0:
-        tf_scores = np.zeros(len(movies))
+        tf_scores_items = np.zeros(als_scores.shape[0], dtype=float)
     else:
-        # Convert pandas boolean mask to numpy boolean array to index sparse X safely
         mask_series = movies['movieId'].isin(seen_raw)
         mask = np.asarray(mask_series, dtype=bool)
         if mask.sum() == 0:
-            tf_scores = np.zeros(len(movies))
+            tf_scores_items = np.zeros(als_scores.shape[0], dtype=float)
         else:
             profile = X[mask].mean(axis=0)
-            # Convert to a plain numpy ndarray (2D row) for sklearn
+            # convert profile to 2D numpy array
             if sparse.issparse(profile):
                 try:
                     profile_arr = profile.toarray()
@@ -185,27 +189,40 @@ def hybrid_recommend(raw_userid, k=10, als_weight=0.6):
             else:
                 profile_arr = np.asarray(profile)
             profile_arr = np.atleast_2d(profile_arr)
-            tf_scores = cosine_similarity(profile_arr, X).ravel()
+            tf_scores_all = cosine_similarity(profile_arr, X).ravel()  # length == len(movies)
+            # Align tf_scores_all (movies order) to ALS item ordering (idx2item)
+            tf_scores_items = np.zeros(als_scores.shape[0], dtype=float)
+            for i in range(als_scores.shape[0]):
+                mid = idx2item[int(i)]
+                row = movieid_to_row.get(int(mid), None)
+                if row is None:
+                    tf_scores_items[i] = 0.0
+                else:
+                    tf_scores_items[i] = float(tf_scores_all[row])
+
     # normalize
     scaler = MinMaxScaler()
     try:
         als_norm = scaler.fit_transform(als_scores.reshape(-1,1)).ravel()
-        tf_norm = scaler.fit_transform(tf_scores.reshape(-1,1)).ravel()
+        tf_norm = scaler.fit_transform(tf_scores_items.reshape(-1,1)).ravel()
     except Exception:
-        # fallback if zero-vector or any issue
         als_norm = als_scores
-        tf_norm = tf_scores
+        tf_norm = tf_scores_items
+
     combined = als_weight * als_norm + (1-als_weight) * tf_norm
+
     # mask seen
     seen = train_user_seen.get(uidx, np.array([], dtype=int))
     if seen.size:
         combined[seen] = -np.inf
-    # pick top
+
+    # top-k
     if k >= len(combined):
         order = np.argsort(-combined)
     else:
         part = np.argpartition(-combined, k)[:k]
         order = part[np.argsort(-combined[part])]
+
     rows = []
     for iid in order[:k]:
         mid = idx2item[int(iid)]
