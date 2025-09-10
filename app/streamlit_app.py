@@ -176,13 +176,16 @@ def hybrid_recommend(raw_userid, k=10, als_weight=0.6):
             tf_scores = np.zeros(len(movies))
         else:
             profile = X[mask].mean(axis=0)
-            # ensure profile is 2D for cosine_similarity
+            # Convert to a plain numpy ndarray (2D row) for sklearn
             if sparse.issparse(profile):
-                if getattr(profile, "ndim", 2) == 1:
-                    profile = profile.reshape(1, -1)
+                try:
+                    profile_arr = profile.toarray()
+                except Exception:
+                    profile_arr = np.asarray(profile)
             else:
-                profile = np.atleast_2d(profile)
-            tf_scores = cosine_similarity(profile, X).ravel()
+                profile_arr = np.asarray(profile)
+            profile_arr = np.atleast_2d(profile_arr)
+            tf_scores = cosine_similarity(profile_arr, X).ravel()
     # normalize
     scaler = MinMaxScaler()
     try:
