@@ -1,14 +1,16 @@
 """
-Streamlit app: TF-IDF + ALS + Hybrid with TMDb posters & summaries (optional).
+Streamlit app: TF-IDF + ALS + Hybrid with TMDb posters & Wikipedia fallback (no API keys required).
 
-Requirements:
-- TMDb key (optional): store as Streamlit secret 'TMDB_API_KEY' OR environment variable TMDB_API_KEY.
-- links.csv must be present in data/ml-latest-small/links.csv mapping movieId -> tmdbId.
+Behavior:
+- If TMDB_API_KEY + links.csv(tmdbId) present -> use TMDb for poster + overview.
+- Else: use Wikipedia (public API) to fetch page thumbnail and short extract (no key needed).
+- If neither returns a poster/summary, render text-only recommendation.
 
-If TMDb key or mapping missing, the app falls back to text-only recommendations.
+Run: streamlit run app/streamlit_app.py
 """
 from pathlib import Path
 import pickle
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -46,8 +48,10 @@ def load_movies(path: Path) -> pd.DataFrame:
     df = df.copy()
     df["genres"] = df["genres"].fillna("").astype(str).str.replace("|", " ", regex=False)
     df["clean_title"] = df["title"].astype(str).str.replace(r"\(\d{4}\)", "", regex=True).str.strip()
+    # pull out year if present (e.g., "Toy Story (1995)")
+    df["year"] = df["title"].str.extract(r"\((\d{4})\)").astype(float).fillna(np.nan).astype("Int64")
     df["doc"] = (df["clean_title"].fillna("") + " " + df["genres"]).str.lower()
-    return df[["movieId", "title", "genres", "clean_title", "doc"]].reset_index(drop=True)
+    return df[["movieId", "title", "genres", "clean_title", "year", "doc"]].reset_index(drop=True)
 
 movies = load_movies(DATA_DIR / "movies.csv")
 
@@ -65,19 +69,25 @@ def load_links(path: Path):
     if not path.exists():
         return {}
     links = pd.read_csv(path)
-    # tmdbId column may be object; coerce to numeric, drop na
-    if "tmdbId" not in links.columns:
+    if "movieId" not in links.columns:
         return {}
-    links = links[["movieId", "tmdbId"]].dropna()
-    links["movieId"] = links["movieId"].astype(int)
-    # tmdbId may have decimals -> int
-    links["tmdbId"] = links["tmdbId"].astype(int)
-    return dict(zip(links["movieId"].tolist(), links["tmdbId"].tolist()))
+    # prefer tmdbId if present
+    if "tmdbId" in links.columns:
+        links = links[["movieId", "tmdbId"]].dropna()
+        links["movieId"] = links["movieId"].astype(int)
+        links["tmdbId"] = links["tmdbId"].astype(int)
+        return dict(zip(links["movieId"].tolist(), links["tmdbId"].tolist()))
+    # else try imdbId
+    if "imdbId" in links.columns:
+        links = links[["movieId", "imdbId"]].dropna()
+        links["movieId"] = links["movieId"].astype(int)
+        links["imdbId"] = links["imdbId"].astype(str)
+        return dict(zip(links["movieId"].tolist(), links["imdbId"].tolist()))
+    return {}
 
 movie_to_tmdb = load_links(LINKS_PATH)
 
 # -------------------- TMDb helper (optional) --------------------
-# Get key from Streamlit secrets or environment
 TMDB_API_KEY = None
 try:
     TMDB_API_KEY = st.secrets["TMDB_API_KEY"]
@@ -85,16 +95,14 @@ except Exception:
     import os
     TMDB_API_KEY = os.environ.get("TMDB_API_KEY", None)
 
-TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w185"  # small poster width
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w185"
 
-@st.cache_data(show_spinner=False, ttl=60*60*24)
 def fetch_tmdb_metadata(tmdb_id: int):
-    """Return dict with 'poster_url' and 'overview' or None on failure."""
-    if TMDB_API_KEY is None or not tmdb_id:
+    if TMDB_API_KEY is None or tmdb_id is None:
         return None
     try:
         url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
-        resp = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=5)
+        resp = requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=6)
         resp.raise_for_status()
         d = resp.json()
         poster = d.get("poster_path")
@@ -105,7 +113,96 @@ def fetch_tmdb_metadata(tmdb_id: int):
     except RequestException:
         return None
 
-# -------------------- TF-IDF recommenders --------------------
+# -------------------- Wikipedia fallback (no API key required) --------------------
+WIKI_API = "https://en.wikipedia.org/w/api.php"
+
+def wiki_search_page(title: str, year=None):
+    """
+    Search Wikipedia for the most relevant page for `title` (optionally include year).
+    Returns the page title string or None.
+    """
+    q = title
+    if year and not pd.isna(year):
+        q = f"{title} ({int(year)})"
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": q,
+        "format": "json",
+        "srlimit": 3,
+    }
+    try:
+        r = requests.get(WIKI_API, params=params, timeout=6)
+        r.raise_for_status()
+        js = r.json()
+        hits = js.get("query", {}).get("search", [])
+        if not hits:
+            # try without year
+            if year:
+                return wiki_search_page(title, year=None)
+            return None
+        return hits[0].get("title")
+    except RequestException:
+        return None
+
+def fetch_wikipedia_metadata(page_title: str):
+    """
+    Given a Wikipedia page title, fetch a short extract and a thumbnail (if available).
+    Returns dict with 'poster_url' and 'overview'.
+    """
+    if not page_title:
+        return None
+    params = {
+        "action": "query",
+        "titles": page_title,
+        "prop": "pageimages|extracts",
+        "exintro": True,
+        "explaintext": True,
+        "format": "json",
+        "pithumbsize": 300,
+    }
+    try:
+        r = requests.get(WIKI_API, params=params, timeout=6)
+        r.raise_for_status()
+        js = r.json()
+        pages = js.get("query", {}).get("pages", {})
+        for pid, pdata in pages.items():
+            thumb = pdata.get("thumbnail", {}).get("source")
+            extract = pdata.get("extract", "") or ""
+            return {"poster_url": thumb, "overview": extract}
+    except RequestException:
+        return None
+
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def fetch_poster_and_summary_via_wikipedia(title: str, year=None):
+    page = wiki_search_page(title, year=year)
+    if page is None:
+        return None
+    return fetch_wikipedia_metadata(page)
+
+# -------------------- Wrapper metadata fetcher (tries TMDb then Wikipedia) --------------------
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def get_metadata_for_movie(movieid: int, title: str, year):
+    """
+    Return metadata dict with keys: poster_url (or None), overview (or ''), source ('tmdb'/'wiki'/'none')
+    """
+    # 1) TMDb path if mapping and key exist
+    tmdb_id = movie_to_tmdb.get(int(movieid))
+    if tmdb_id is not None and TMDB_API_KEY:
+        m = fetch_tmdb_metadata(tmdb_id)
+        if m:
+            m["source"] = "tmdb"
+            return m
+    # 2) Wikipedia fallback using title + year
+    # Use clean title (strip year) or original title when searching
+    wiki_meta = fetch_poster_and_summary_via_wikipedia(title, year)
+    if wiki_meta:
+        wiki_meta["source"] = "wiki"
+        return wiki_meta
+    # 3) final fallback: empty
+    return {"poster_url": None, "overview": "", "source": "none"}
+
+# -------------------- TF-IDF recommenders (unchanged) --------------------
 def recommend_from_title(query: str, top_k: int = 10, min_sim: float = 0.10):
     if not query or not query.strip():
         return pd.DataFrame(columns=["movieId","title","genres"]), 0.0
@@ -120,7 +217,7 @@ def recommend_from_title(query: str, top_k: int = 10, min_sim: float = 0.10):
     sims = cosine_similarity(seed_vec, X).ravel()
     order = np.argsort(-sims)
     order = [i for i in order if i != seed_idx][:top_k]
-    recs = movies.iloc[order][["movieId","title", "genres"]].reset_index(drop=True)
+    recs = movies.iloc[order][["movieId","title", "genres", "year"]].reset_index(drop=True)
     recs.index = range(1, len(recs) + 1)
     return recs, best_sim
 
@@ -144,11 +241,11 @@ def recommend_from_likes_safe(selected_titles: list, top_k: int = 10):
     order = np.argsort(-sims)
     liked_set = set(idxs)
     rec_indices = [i for i in order if i not in liked_set][:top_k]
-    recs = movies.iloc[rec_indices][["movieId","title", "genres"]].copy().reset_index(drop=True)
+    recs = movies.iloc[rec_indices][["movieId","title", "genres", "year"]].copy().reset_index(drop=True)
     recs.index = range(1, len(recs) + 1)
     return recs
 
-# -------------------- ALS artifacts loader --------------------
+# -------------------- ALS loader + hybrid (unchanged logic but returns movieId/title/score) --------------------
 @st.cache_resource(show_spinner=False)
 def load_als_artifacts():
     md = MODELS_DIR
@@ -176,11 +273,8 @@ else:
     idx2item = maps["idx2item"]
     user2idx = maps["user2idx"]
     idx2user = maps["idx2user"]
-    # helper: map movieId -> row index in movies DataFrame (for TF-IDF alignment)
     movieid_to_row = {int(mid): int(i) for i, mid in movies["movieId"].reset_index(drop=True).items()}
-    n_items = item_f.shape[0]
 
-# -------------------- ALS / Hybrid recommenders --------------------
 def als_recommend_for_user(raw_userid, k=10):
     if als_art is None:
         return pd.DataFrame(columns=["movieId","title","score"])
@@ -271,22 +365,20 @@ def short_text(s: str, n=220):
     return (s if len(s) <= n else s[:n].rsplit(" ",1)[0] + " ...")
 
 @st.cache_data(show_spinner=False, ttl=60*60*24)
-def get_tmdb_for_movieid(movieid: int):
-    """Return metadata dict for movieId (poster_url, overview) or None."""
-    tmdb_id = movie_to_tmdb.get(int(movieid))
-    if tmdb_id is None or TMDB_API_KEY is None:
-        return None
-    return fetch_tmdb_metadata(tmdb_id)
+def get_metadata(movieid: int):
+    """Return poster_url, overview, source. Uses TMDb then Wikipedia fallback."""
+    row = movies.loc[movies['movieId']==movieid]
+    title = row['clean_title'].iloc[0] if not row.empty else ""
+    year = int(row['year'].iloc[0]) if (not row.empty and not pd.isna(row['year'].iloc[0])) else None
+    meta = get_metadata_for_movie(movieid, title, year)
+    if meta is None:
+        return {"poster_url": None, "overview": "", "source": "none"}
+    return meta
 
 def render_recommendations_with_posters(df: pd.DataFrame, cols_per_row: int = 3):
-    """
-    df expected to have columns: movieId, title (optionally genres, score).
-    Renders posters and a short summary. If poster not available, shows title + text.
-    """
     if df.empty:
         st.info("No recommendations.")
         return
-    # create grid
     for start in range(0, len(df), cols_per_row):
         slice_df = df.iloc[start:start+cols_per_row]
         cols = st.columns(len(slice_df))
@@ -296,23 +388,21 @@ def render_recommendations_with_posters(df: pd.DataFrame, cols_per_row: int = 3)
             score = row.get("score", None)
             meta = None
             try:
-                meta = get_tmdb_for_movieid(movieid)
+                meta = get_metadata(movieid)
             except Exception:
                 meta = None
-            if meta and meta.get("poster_url"):
-                c.image(meta["poster_url"], use_column_width=True, caption=title)
+            poster = meta.get("poster_url") if meta else None
+            overview = meta.get("overview") if meta else ""
+            if poster:
+                c.image(poster, use_column_width=True, caption=title)
                 c.write("**" + title + "**")
-                overview = meta.get("overview", "")
                 if overview:
                     c.write(short_text(overview, n=240))
             else:
-                # no poster: show a placeholder with text
                 c.write("**" + title + "**")
-                # try TMDB overview even if no poster
-                if meta and meta.get("overview"):
-                    c.write(short_text(meta.get("overview", ""), n=240))
+                if overview:
+                    c.write(short_text(overview, n=240))
                 else:
-                    # fallback: show genres if available
                     gr = movies.loc[movies['movieId']==movieid, 'genres']
                     if not gr.empty:
                         c.write(gr.iloc[0])
@@ -383,4 +473,4 @@ else:  # Hybrid
                 render_recommendations_with_posters(recs, cols_per_row=3)
 
 st.markdown("---")
-st.caption("TF-IDF + ALS hybrid recommender — use TF-IDF for cold-start and ALS for personalization. Posters loaded from TMDb when API key and mapping are available.")
+st.caption("TF-IDF + ALS hybrid recommender — use TF-IDF for cold-start and ALS for personalization. Posters loaded from TMDb when API key and mapping are available; otherwise Wikipedia is used as a fallback.")
